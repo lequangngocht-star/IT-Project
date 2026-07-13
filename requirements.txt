@@ -1,0 +1,19 @@
+# --- MILESTONE 1: INGESTION & TEXT EXTRACTOR ---
+pdfplumber>=0.10.0
+python-docx>=1.1.0
+arxiv>=2.1.3
+tqdm>=4.66.0
+
+# --- MILESTONE 2: EMBEDDING & FAISS VECTOR STORE ---
+torch>=2.2.0
+transformers>=4.40.0
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+
+# --- MILESTONE 4: LOCAL LLM INFERENCE ---
+accelerate>=0.30.0
+bitsandbytes>=0.43.0
+
+# --- SYSTEM & DEVELOPMENT TESTING ---
+pytest>=8.0.0
+numpy>=1.26.0 
