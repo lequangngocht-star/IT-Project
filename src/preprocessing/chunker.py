@@ -1,28 +1,19 @@
-"""
-src/preprocessing/chunker.py
-------------------------------
-Phân rã cấu trúc văn bản thành khối ngữ cảnh chunks có overlap.
-Quản lý lưu trữ và nạp chỉ mục JSON cho toàn bộ hệ thống.
-"""
-
-import sys
+import os
 import re
 import json
 from pathlib import Path
-from typing import Iterator
+from typing import List, Dict, Iterator
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from config import CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_LEN, DATA_PROCESSED_DIR
-from src.logger import get_logger
+CHUNK_SIZE = 600       # Độ dài ký tự lý tưởng cho 1 chunk
+CHUNK_OVERLAP = 100    # Độ gối đầu giữa 2 chunk để tránh đứt đoạn ngữ cảnh
+MIN_CHUNK_LEN = 100    # Loại bỏ các đoạn quá ngắn rác
 
-logger = get_logger(__name__)
-
-
-def _split_into_sentences(text: str) -> list[str]:
+def split_into_sentences(text: str) -> List[str]:
+    """Tách đoạn thành các câu hoàn chỉnh dựa trên dấu câu."""
     return re.split(r"(?<=[.!?])\s+", text)
 
-
-def _iter_paragraph_chunks(text: str, chunk_size: int) -> Iterator[str]:
+def iter_paragraph_chunks(text: str, chunk_size: int = CHUNK_SIZE) -> Iterator[str]:
+    """Cắt nhỏ văn bản ưu tiên giữ nguyên khối đoạn văn và câu."""
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     buffer = ""
 
@@ -31,29 +22,47 @@ def _iter_paragraph_chunks(text: str, chunk_size: int) -> Iterator[str]:
             if buffer:
                 yield buffer
                 buffer = ""
-            sentences = _split_into_sentences(para)
+            sentences = split_into_sentences(para)
             for sent in sentences:
                 if len(buffer) + len(sent) + 1 <= chunk_size:
                     buffer = (buffer + " " + sent).strip() if buffer else sent
                 else:
-                    if buffer: yield buffer
+                    if buffer:
+                        yield buffer
                     buffer = sent
         else:
             candidate = (buffer + "\n\n" + para).strip() if buffer else para
             if len(candidate) <= chunk_size:
                 buffer = candidate
             else:
-                if buffer: yield buffer
+                if buffer:
+                    yield buffer
                 buffer = para
-    if buffer: yield buffer
 
+    if buffer:
+        yield buffer
 
-def create_chunks_with_metadata(doc: dict) -> list[dict]:
-    text = doc.get("cleaned_text", "") or doc.get("raw_text", "")
-    if not text.strip(): return []
+def process_file_to_chunks(file_path: Path) -> List[Dict]:
+    """Đọc 1 file txt, bóc metadata ở đầu file và chia thành các chunk chuẩn."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
 
-    raw_chunks = list(_iter_paragraph_chunks(text, CHUNK_SIZE))
-    result = []
+    # Bóc metadata ở phần header đã ghi lúc crawl
+    subject = "IT"
+    title = file_path.stem
+    source = "Wikipedia Academic"
+
+    header_match = re.match(r"^Subject:\s*(.*?)\n(?:Topic|Title):\s*(.*?)\nSource:\s*(.*?)\n\n", content)
+    if header_match:
+        subject = header_match.group(1).strip()
+        title = header_match.group(2).strip()
+        source = header_match.group(3).strip()
+        body_text = content[header_match.end():].strip()
+    else:
+        body_text = content.strip()
+
+    raw_chunks = list(iter_paragraph_chunks(body_text, CHUNK_SIZE))
+    chunks = []
     tail = ""
 
     for i, chunk_text in enumerate(raw_chunks):
@@ -65,55 +74,28 @@ def create_chunks_with_metadata(doc: dict) -> list[dict]:
         if len(chunk_text) < MIN_CHUNK_LEN:
             continue
 
-        chunk_id = f"{Path(doc['source']).stem}_chunk_{i:04d}"
-        result.append({
-            "chunk_id":    chunk_id,
+        chunk_id = f"{subject}_{file_path.stem}_c{i:04d}"
+        chunks.append({
+            "chunk_id": chunk_id,
             "chunk_index": i,
-            "total_chunks": len(raw_chunks),
-            "text":        chunk_text,
-            "char_count":  len(chunk_text),
-            "source":      doc["source"],
-            "file_name":   doc.get("file_name", ""),
-            "file_type":   doc.get("file_type", ""),
-            "num_pages":   doc.get("num_pages")
+            "subject": subject,
+            "title": title,
+            "source": source,
+            "file_name": file_path.name,
+            "char_count": len(chunk_text),
+            "text": chunk_text
         })
         tail = chunk_text[-CHUNK_OVERLAP:] if CHUNK_OVERLAP > 0 else ""
 
-    return result
-
-
-# ─────────────────────────────────────────────────────────────
-# PHÂN HỆ LƯU / TẢI CHUNKS HỆ THỐNG
-# ─────────────────────────────────────────────────────────────
-
-def save_chunks(chunks: list[dict], output_path: str | Path | None = None) -> Path:
-    """
-    Lưu danh sách chunks kèm metadata vào file JSON để tái sử dụng.
-    """
-    if output_path is None:
-        DATA_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-        output_path = DATA_PROCESSED_DIR / "chunks.json"
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(chunks, f, ensure_ascii=False, indent=2)
-
-    logger.info(f"Đã lưu thành công {len(chunks)} chunks vào -> {output_path}")
-    return output_path
-
-
-def load_chunks(input_path: str | Path) -> list[dict]:
-    """
-    Tải danh sách chunks từ file JSON chỉ mục tri thức.
-    """
-    path = Path(input_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Không tìm thấy tệp dữ liệu chunks chỉ mục: {path}")
-
-    with open(path, encoding="utf-8") as f:
-        chunks = json.load(f)
-
-    logger.info(f"Đã tải thành công {len(chunks)} chunks từ hệ thống -> {path}")
     return chunks
+
+def save_chunks(chunks: List[Dict], output_file: str = "data/processed/chunks.json"):
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False, indent=2)
+    print(f"[✓] Đã lưu thành công {len(chunks)} chunks vào: {out_path.resolve()}")
+
+def load_chunks(input_file: str = "data/processed/chunks.json") -> List[Dict]:
+    with open(input_file, "r", encoding="utf-8") as f:
+        return json.load(f)

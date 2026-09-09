@@ -1,558 +1,411 @@
-"""
-app.py
--------
-FastAPI application — REST API cho hệ thống RAG thư viện số.
-
-Đây là lớp giao tiếp giữa frontend / client và toàn bộ pipeline M1→M5.
-
-Endpoints:
-    POST /ask                  → Hỏi đáp RAG (query → answer + sources)
-    GET  /health               → Kiểm tra trạng thái hệ thống
-    GET  /stats                → Thống kê index (số chunks, model info)
-    POST /upload               → Upload tài liệu mới vào thư viện
-    POST /index/rebuild        → Rebuild FAISS index sau khi upload
-    GET  /eval/run             → Chạy evaluation và trả về report
-    GET  /history              → Lịch sử truy vấn trong session
-
-Thiết kế:
-- Startup: load tất cả model 1 lần, lưu vào app.state.
-- Mỗi request dùng lại model đã load → không tốn thời gian reload.
-- Async endpoint nhưng model inference vẫn blocking (chạy trong threadpool).
-- Pydantic schemas validate input/output nghiêm ngặt.
-
-Chạy:
-    uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-
-    # Production
-    uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
-    # workers=1 vì model LLM không thread-safe khi share state
-"""
-
-from __future__ import annotations
-
-import asyncio
-import shutil
-import sys
+# app.py
 import time
-from contextlib import asynccontextmanager
+import json
+import os
 from pathlib import Path
-from typing import Optional
+import requests
+import streamlit as st
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-
-sys.path.insert(0, str(Path(__file__).parent))
-
-from config import (
-    DATA_RAW_DIR,
-    FAISS_INDEX_FILE,
-    FAISS_META_FILE,
-    LLM_MODEL_NAME,
-    RETRIEVAL_TOP_K,
-    RERANKER_TOP_N,
-    RERANKER_ENABLED,
-    SUPPORTED_EXTENSIONS,
+# 1. CẤU HÌNH GIAO DIỆN HỌC THUẬT
+st.set_page_config(
+    page_title="Thư Viện Số CNTT - Hệ Thống RAG & Tra Cứu Học Liệu",
+    page_icon="🎓",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
-from src.logger import get_logger
 
-logger = get_logger("app")
+# Tùy biến CSS nâng cao độ tương phản và thẩm mỹ
+st.markdown("""
+<style>
+    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+    .main-header {
+        background: linear-gradient(135deg, #1E3A8A 0%, #3B82F6 100%);
+        padding: 16px 22px;
+        border-radius: 10px;
+        color: white;
+        margin-bottom: 15px;
+    }
+    .main-header h1 { color: white; margin: 0; font-size: 1.65rem; font-weight: 700; }
+    .main-header p { color: #E0E7FF; margin: 4px 0 0 0; font-size: 0.88rem; }
+    
+    .perf-container {
+        display: flex;
+        gap: 10px;
+        margin-top: 8px;
+        margin-bottom: 12px;
+    }
+    .perf-card {
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 6px;
+        padding: 6px 10px;
+        flex: 1;
+        text-align: center;
+    }
+    .perf-label { font-size: 0.7rem; color: #64748B; font-weight: 600; text-transform: uppercase; }
+    .perf-value { font-size: 0.95rem; color: #0F172A; font-weight: 700; }
+    
+    .source-box {
+        background: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-left: 4px solid #3B82F6;
+        border-radius: 6px;
+        padding: 10px;
+        margin-bottom: 8px;
+    }
+    .source-tag {
+        background: #EFF6FF;
+        color: #1D4ED8;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.78rem;
+    }
+    .score-tag {
+        background: #F0FDF4;
+        color: #15803D;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.78rem;
+    }
+    .doc-card {
+        background: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 8px;
+        padding: 14px;
+        margin-bottom: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────
-# In-memory query history (session-scoped)
-# ─────────────────────────────────────────────────────────────
-_query_history: list[dict] = []
-MAX_HISTORY = 50
+# 2. KHỞI TẠO PIPELINE TRUY XUẤT (CACHE TÀI NGUYÊN)
+@st.cache_resource(show_spinner=False)
+def load_retrieval_pipeline():
+    from config import RETRIEVAL_TOP_K, RERANKER_TOP_N
+    from src.retrieval.searcher import DenseRetriever
+    from src.retrieval.reranker import CrossEncoderReranker
+    
+    retriever = DenseRetriever(top_k=RETRIEVAL_TOP_K)
+    reranker = CrossEncoderReranker()
+    return retriever, reranker
 
+# 3. QUẢN LÝ KHO DỮ LIỆU GỐC 1,184 TÀI LIỆU
+@st.cache_data(show_spinner=False)
+def load_library_catalog():
+    """Quét thư mục data/raw/ để lập danh mục tài liệu theo môn học."""
+    raw_dir = Path("data/raw")
+    catalog = {}
+    
+    if not raw_dir.exists():
+        return catalog
 
-# ─────────────────────────────────────────────────────────────
-# Pydantic schemas
-# ─────────────────────────────────────────────────────────────
+    # Quét tất cả các file trong thư mục raw
+    for path in raw_dir.rglob("*"):
+        if path.is_file() and path.suffix.lower() in [".txt", ".pdf", ".docx", ".json"]:
+            # Nếu phân theo thư mục con (data/raw/DB/file.txt)
+            if path.parent != raw_dir:
+                subject = path.parent.name.upper()
+            else:
+                # Nếu đặt tên theo tiền tố (DB_file.txt hoặc DB - file.txt)
+                name_parts = path.stem.replace("-", "_").split("_")
+                subject = name_parts[0].upper() if len(name_parts) > 1 else "CHUNG"
+                
+            if subject not in catalog:
+                catalog[subject] = []
+                
+            catalog[subject].append({
+                "file_name": path.name,
+                "file_path": str(path),
+                "size_kb": round(path.stat().st_size / 1024, 1),
+                "extension": path.suffix.lower()
+            })
+            
+    return catalog
 
-class AskRequest(BaseModel):
-    query: str = Field(..., min_length=3, max_length=1000,
-                       description="Câu hỏi của người dùng")
-    top_k: Optional[int] = Field(None, ge=1, le=20,
-                                 description="Override số chunk retrieve")
-    top_n: Optional[int] = Field(None, ge=1, le=10,
-                                 description="Override số chunk vào context LLM")
-    use_reranker: Optional[bool] = Field(None,
-                                         description="Override bật/tắt reranker")
+st.markdown("""
+<div class="main-header">
+    <h1>🎓 Thư Viện Số Chuyên Ngành CNTT - Hệ Thống RAG & Kho Học Liệu</h1>
+    <p>Kiến trúc Advanced RAG: BAAI/bge-m3 • BGE-Reranker-v2-m3 • Ollama Qwen2.5 & Quản lý 1,184 tài liệu học thuật</p>
+</div>
+""", unsafe_allow_html=True)
 
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "query": "Điều kiện tiên quyết của môn Machine Learning là gì?",
-                "top_k": 10,
-                "top_n": 5,
+with st.spinner("Đang kết nối kho vector FAISS và nạp mô hình Reranker..."):
+    retriever, reranker = load_retrieval_pipeline()
+
+library_catalog = load_library_catalog()
+total_docs_found = sum(len(docs) for docs in library_catalog.values())
+
+# 4. THANH ĐIỀU KHIỂN (SIDEBAR)
+with st.sidebar:
+    st.markdown("### ⚙️ Thông Số Hệ Thống")
+    st.info(
+        f"📚 **Tổng số tài liệu:** {total_docs_found:,} files\n\n"
+        f"🏛 **Số phân môn:** {len(library_catalog)} chuyên đề\n\n"
+        "🧠 **Embedding:** BAAI/bge-m3 (1024-dim)\n\n"
+        "⚡ **Reranker:** BGE-Reranker-v2-m3\n\n"
+        "🤖 **LLM Engine:** Ollama / Qwen2.5-1.5B"
+    )
+    
+    st.divider()
+    st.markdown("### 🎛 Tham Số RAG")
+    top_k = st.slider("Ứng viên Dense Search (Top-K):", 4, 15, 6, 1)
+    top_n = st.slider("Ngữ cảnh đưa vào LLM (Top-N):", 1, 4, 2, 1)
+    
+    st.divider()
+    st.markdown("### 💡 Câu Hỏi Thực Nghiệm Mẫu")
+    sample_queries = [
+        "What are the four ACID properties in database management systems and what does each guarantee?",
+        "Sự khác nhau giữa học có giám sát và học không giám sát trong machine learning?",
+        "Thread và Process khác nhau như thế nào?",
+        "What is a Binary Search Tree and what is the worst-case time complexity of its search operation?",
+        "How does the A* search algorithm determine the optimal path using heuristic functions?"
+    ]
+    
+    for idx, q in enumerate(sample_queries):
+        btn_label = q if len(q) < 42 else q[:40] + "..."
+        if st.button(f"📌 {btn_label}", key=f"sq_{idx}", use_container_width=True):
+            st.session_state["active_query"] = q
+
+    st.divider()
+    if st.button("🗑 Làm mới phiên trò chuyện", use_container_width=True, type="secondary"):
+        st.session_state.messages = []
+        st.rerun()
+
+# 5. PHÂN CHIA TAB: HỎI ĐÁP VÀ XEM TÀI LIỆU
+tab_chat, tab_docs = st.tabs(["💬 Trợ Lý Hỏi Đáp (RAG Chatbot)", "📚 Tra Cứu Kho Tài Liệu (1,184 Files)"])
+
+# =====================================================================
+# TAB 1: GIAO DIỆN TRỢ LÝ HỎI ĐÁP THỜI GIAN THỰC (RAG CHAT)
+# =====================================================================
+with tab_chat:
+    if "messages" not in st.session_state:
+        st.session_state.messages = [
+            {
+                "role": "assistant",
+                "content": "Xin chào! Tôi là trợ lý học thuật thư viện số. Bạn có thể tra cứu kiến thức học thuật từ 1,184 tài liệu chuyên ngành CNTT bằng cả tiếng Anh và tiếng Việt.",
+                "sources": [],
+                "perf": None
             }
+        ]
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            
+            if msg["role"] == "assistant" and msg.get("perf"):
+                p = msg["perf"]
+                st.markdown(f"""
+                <div class="perf-container">
+                    <div class="perf-card">
+                        <div class="perf-label">Dense Search</div>
+                        <div class="perf-value">{p['dense_ms']:.1f} ms</div>
+                    </div>
+                    <div class="perf-card">
+                        <div class="perf-label">Reranker</div>
+                        <div class="perf-value">{p['rerank_ms']:.1f} ms</div>
+                    </div>
+                    <div class="perf-card">
+                        <div class="perf-label">Ollama Sinh LLM</div>
+                        <div class="perf-value" style="color: #16A34A;">{p['gen_s']:.2f} s</div>
+                    </div>
+                    <div class="perf-card">
+                        <div class="perf-label">Tổng Độ Trễ</div>
+                        <div class="perf-value" style="color: #2563EB;">{p['total_s']:.2f} s</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            if msg.get("sources"):
+                with st.expander(f"📚 Xem {len(msg['sources'])} tài liệu nguồn được trích dẫn làm căn cứ"):
+                    for s_idx, src in enumerate(msg["sources"], 1):
+                        sub = src.get("subject", "N/A")
+                        title = src.get("title", "N/A")
+                        score = src.get("rerank_score", 0.0)
+                        txt = src.get("text", "")
+                        st.markdown(f"""
+                        <div class="source-box">
+                            <span class="source-tag">Môn: {sub}</span> &nbsp;
+                            <span class="source-tag" style="background:#F1F5F9; color:#475569;">Chủ đề: {title}</span> &nbsp;
+                            <span class="score-tag">Độ liên quan: {score:.2f}</span>
+                            <div style="font-size: 0.88rem; color: #334155; margin-top: 6px; line-height: 1.45;">
+                                "{txt[:280]}..."
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+    def stream_ollama_response(prompt: str, model_name: str = "qwen2.5:1.5b"):
+        url = "http://localhost:11434/api/generate"
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "stream": True,
+            "options": {"num_predict": 256, "temperature": 0.1, "top_p": 0.9}
         }
-    }
+        try:
+            response = requests.post(url, json=payload, stream=True, timeout=40)
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    chunk = json.loads(line.decode("utf-8"))
+                    yield chunk.get("response", "")
+        except Exception as e:
+            yield f"\n\n[Lỗi kết nối Ollama]: {e}. Vui lòng khởi động Ollama trên máy."
 
-
-class SourceItem(BaseModel):
-    rank:         int
-    file_name:    str
-    chunk_index:  int
-    score:        float
-    rerank_score: float
-
-
-class AskResponse(BaseModel):
-    query:        str
-    answer:       str
-    has_answer:   bool
-    context_used: int
-    latency_s:    float
-    sources:      list[SourceItem]
-
-
-class HealthResponse(BaseModel):
-    status:       str           # "ok" | "degraded" | "error"
-    index_loaded: bool
-    llm_loaded:   bool
-    index_size:   int
-    model_name:   str
-    uptime_s:     float
-
-
-class StatsResponse(BaseModel):
-    index_size:       int
-    embedding_model:  str
-    llm_model:        str
-    reranker_enabled: bool
-    top_k:            int
-    top_n:            int
-    total_queries:    int
-
-
-class UploadResponse(BaseModel):
-    filename:    str
-    size_bytes:  int
-    message:     str
-
-
-class IndexRebuildResponse(BaseModel):
-    status:      str
-    chunks_count: int
-    elapsed_s:   float
-    message:     str
-
-
-# ─────────────────────────────────────────────────────────────
-# Startup / Shutdown — load models 1 lần
-# ─────────────────────────────────────────────────────────────
-
-_start_time = time.time()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Chạy khi server start: load Retrieval Pipeline + LLM vào app.state.
-    Chạy khi server stop: cleanup (nếu cần).
-
-    Dùng asynccontextmanager thay vì on_event (deprecated từ FastAPI 0.93+).
-    """
-    logger.info("═" * 55)
-    logger.info("  RAG LIBRARY API — Đang khởi động...")
-    logger.info("═" * 55)
-
-    # Kiểm tra prerequisite
-    app.state.index_loaded = False
-    app.state.llm_loaded   = False
-    app.state.retriever    = None
-    app.state.reranker     = None
-    app.state.llm          = None
-
-    if not FAISS_INDEX_FILE.exists():
-        logger.warning(
-            "FAISS index chưa tồn tại. Một số endpoint sẽ không hoạt động.\n"
-            "  → Chạy: python src/pipeline_m1.py && python src/pipeline_m2.py"
-        )
+    user_input = None
+    if "active_query" in st.session_state and st.session_state["active_query"]:
+        user_input = st.session_state.pop("active_query")
     else:
-        try:
-            from src.pipeline_m3 import build_retrieval_pipeline
-            retriever, reranker = build_retrieval_pipeline(
-                use_reranker=RERANKER_ENABLED,
-                top_k=RETRIEVAL_TOP_K,
-                top_n=RERANKER_TOP_N,
-            )
-            app.state.retriever    = retriever
-            app.state.reranker     = reranker
-            app.state.index_loaded = True
-            logger.info("✅ Retrieval Pipeline sẵn sàng")
-        except Exception as e:
-            logger.error(f"Không load được Retrieval Pipeline: {e}")
-
-        try:
-            from src.LLM.model_manager import LLMManager
-            llm = LLMManager()
-            llm.load()
-            app.state.llm        = llm
-            app.state.llm_loaded = True
-            logger.info(f"✅ LLM sẵn sàng: {LLM_MODEL_NAME}")
-        except Exception as e:
-            logger.error(f"Không load được LLM: {e}")
-
-    logger.info("  API sẵn sàng tại http://localhost:8000")
-    logger.info("  Docs: http://localhost:8000/docs")
-    logger.info("═" * 55)
-
-    yield  # ← Server chạy ở đây
-
-    # Shutdown cleanup
-    logger.info("Server đang tắt...")
-
-
-# ─────────────────────────────────────────────────────────────
-# App instance
-# ─────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="RAG Library API",
-    description=(
-        "Hệ thống hỏi đáp thông minh cho Thư viện số Trường Đại học ABC.\n\n"
-        "Sử dụng kiến trúc RAG (Retrieval-Augmented Generation) với BGE-M3 embedding "
-        "và LLM mã nguồn mở chạy local."
-    ),
-    version="1.0.0",
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-# CORS — cho phép frontend gọi API
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],     # Production: thay bằng domain cụ thể
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ─────────────────────────────────────────────────────────────
-# Helper
-# ─────────────────────────────────────────────────────────────
-
-def _require_index(app_state) -> None:
-    """Raise 503 nếu FAISS index chưa được load."""
-    if not app_state.index_loaded:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "FAISS index chưa sẵn sàng. "
-                "Chạy pipeline_m1.py và pipeline_m2.py trước, "
-                "sau đó restart server."
-            ),
-        )
-
-
-def _require_llm(app_state) -> None:
-    """Raise 503 nếu LLM chưa được load."""
-    if not app_state.llm_loaded:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "LLM chưa sẵn sàng. "
-                "Kiểm tra log server để biết lý do."
-            ),
-        )
-
-
-# ─────────────────────────────────────────────────────────────
-# Endpoints
-# ─────────────────────────────────────────────────────────────
-
-@app.get("/health", response_model=HealthResponse, tags=["System"])
-async def health_check():
-    """
-    Kiểm tra trạng thái hệ thống.
-    Dùng để monitoring, load balancer health check.
-    """
-    index_size = 0
-    if app.state.index_loaded and app.state.retriever:
-        try:
-            index_size = app.state.retriever._vector_store.size
-        except Exception:
-            pass
-
-    all_ok = app.state.index_loaded and app.state.llm_loaded
-    return HealthResponse(
-        status      = "ok" if all_ok else "degraded",
-        index_loaded = app.state.index_loaded,
-        llm_loaded   = app.state.llm_loaded,
-        index_size   = index_size,
-        model_name   = LLM_MODEL_NAME,
-        uptime_s     = round(time.time() - _start_time, 1),
-    )
-
-
-@app.get("/stats", response_model=StatsResponse, tags=["System"])
-async def get_stats():
-    """Thống kê chi tiết về cấu hình và trạng thái hệ thống."""
-    index_size = 0
-    if app.state.index_loaded and app.state.retriever:
-        try:
-            index_size = app.state.retriever._vector_store.size
-        except Exception:
-            pass
-
-    return StatsResponse(
-        index_size       = index_size,
-        embedding_model  = "BAAI/bge-m3",
-        llm_model        = LLM_MODEL_NAME,
-        reranker_enabled = RERANKER_ENABLED,
-        top_k            = RETRIEVAL_TOP_K,
-        top_n            = RERANKER_TOP_N,
-        total_queries    = len(_query_history),
-    )
-
-
-@app.post("/ask", response_model=AskResponse, tags=["RAG"])
-async def ask(request: AskRequest):
-    """
-    **Endpoint chính** — Hỏi đáp RAG.
-
-    Nhận câu hỏi tiếng Việt, trả về:
-    - `answer`: Câu trả lời từ LLM dựa trên tài liệu thư viện.
-    - `sources`: Danh sách tài liệu nguồn được trích dẫn.
-    - `has_answer`: False nếu LLM không tìm thấy thông tin.
-    - `latency_s`: Thời gian xử lý end-to-end.
-
-    **Lưu ý:** Endpoint này blocking do LLM inference.
-    Timeout khuyến nghị: 60 giây.
-    """
-    _require_index(app.state)
-    _require_llm(app.state)
-
-    query = request.query.strip()
-    logger.info(f"POST /ask | query='{query[:60]}'")
-
-    try:
-        # Chạy trong threadpool để không block event loop
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,  # default threadpool
-            _run_rag_sync,
-            query,
-            request.top_n,
-            app.state.retriever,
-            app.state.reranker,
-            app.state.llm,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        logger.error(f"Lỗi RAG query: {e}")
-        raise HTTPException(status_code=500, detail=f"Lỗi xử lý: {str(e)}")
-
-    # Lưu vào history
-    _query_history.append({
-        "query":      query,
-        "has_answer": response.has_answer,
-        "latency_s":  response.latency_s,
-        "timestamp":  time.time(),
-    })
-    if len(_query_history) > MAX_HISTORY:
-        _query_history.pop(0)
-
-    return AskResponse(
-        query        = response.query,
-        answer       = response.answer,
-        has_answer   = response.has_answer,
-        context_used = response.context_used,
-        latency_s    = response.latency_s,
-        sources      = [
-            SourceItem(
-                rank         = s.get("rank", i + 1),
-                file_name    = s.get("file_name", ""),
-                chunk_index  = s.get("chunk_index", -1),
-                score        = round(s.get("score", 0.0), 4),
-                rerank_score = round(s.get("rerank_score", 0.0), 4),
-            )
-            for i, s in enumerate(response.sources)
-        ],
-    )
-
-
-def _run_rag_sync(query, top_n, retriever, reranker, llm):
-    """Wrapper đồng bộ cho rag_query — chạy trong threadpool."""
-    from src.pipeline_m3 import run_query as retrieve
-    from src.pipeline_m4 import rag_query
-    return rag_query(query, retriever, reranker, llm, top_n=top_n)
-
-
-@app.post("/upload", response_model=UploadResponse, tags=["Library"])
-async def upload_document(file: UploadFile = File(...)):
-    """
-    Upload tài liệu mới vào thư viện số.
-
-    Hỗ trợ: PDF, DOCX, TXT.
-    Sau khi upload, gọi `POST /index/rebuild` để cập nhật FAISS index.
-
-    **Giới hạn:** 50MB mỗi file.
-    """
-    ext = Path(file.filename).suffix.lower()
-    if ext not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Định dạng '{ext}' không được hỗ trợ. Chấp nhận: {SUPPORTED_EXTENSIONS}",
-        )
-
-    DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
-    dest = DATA_RAW_DIR / file.filename
-
-    content = await file.read()
-
-    # Giới hạn 50MB
-    if len(content) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File vượt quá 50MB")
-
-    dest.write_bytes(content)
-    logger.info(f"Upload: {file.filename} ({len(content):,} bytes)")
-
-    return UploadResponse(
-        filename   = file.filename,
-        size_bytes = len(content),
-        message    = f"Đã lưu '{file.filename}'. Gọi POST /index/rebuild để cập nhật index.",
-    )
-
-
-@app.post("/index/rebuild", response_model=IndexRebuildResponse, tags=["Library"])
-async def rebuild_index(background_tasks: BackgroundTasks):
-    """
-    Rebuild FAISS index từ toàn bộ tài liệu trong data/raw/.
-
-    Quá trình: Ingestion → Chunking → Embedding → FAISS index.
-    Thời gian: vài phút tùy số lượng tài liệu và hardware.
-
-    **Lưu ý:** Endpoint này chạy đồng bộ và có thể mất vài phút.
-    Trong production nên dùng background task queue (Celery/RQ).
-    """
-    logger.info("POST /index/rebuild — bắt đầu rebuild...")
-    t0 = time.time()
-
-    try:
-        loop = asyncio.get_event_loop()
-        chunks_count = await loop.run_in_executor(None, _rebuild_index_sync)
-        elapsed = time.time() - t0
-
-        # Reload retriever với index mới
-        if FAISS_INDEX_FILE.exists():
-            try:
-                from src.pipeline_m3 import build_retrieval_pipeline
-                retriever, reranker = build_retrieval_pipeline()
-                app.state.retriever    = retriever
-                app.state.reranker     = reranker
-                app.state.index_loaded = True
-                logger.info("Retrieval pipeline đã reload với index mới")
-            except Exception as e:
-                logger.error(f"Reload pipeline thất bại: {e}")
-
-        return IndexRebuildResponse(
-            status       = "success",
-            chunks_count = chunks_count,
-            elapsed_s    = round(elapsed, 2),
-            message      = f"Rebuild hoàn tất: {chunks_count} chunks trong {elapsed:.1f}s",
-        )
-
-    except Exception as e:
-        logger.error(f"Rebuild thất bại: {e}")
-        raise HTTPException(status_code=500, detail=f"Rebuild thất bại: {str(e)}")
-
-
-def _rebuild_index_sync() -> int:
-    """Chạy M1 + M2 pipeline và trả về số chunks."""
-    from src.pipeline_m1 import run_pipeline as run_m1
-    from src.pipeline_m2 import run_pipeline_m2
-
-    chunks = run_m1()
-    run_pipeline_m2(rebuild=True)
-    return len(chunks)
-
-
-@app.get("/history", tags=["RAG"])
-async def get_history(limit: int = 20):
-    """
-    Lịch sử các truy vấn trong session hiện tại.
-    Tối đa 50 queries gần nhất.
-    """
-    recent = _query_history[-limit:][::-1]  # Mới nhất trước
-    return {
-        "total":   len(_query_history),
-        "showing": len(recent),
-        "history": recent,
-    }
-
-
-@app.post("/eval/run", tags=["Evaluation"])
-async def run_evaluation(n_samples: int = 10):
-    """
-    Chạy evaluation trên tập test và trả về báo cáo metrics.
-
-    Args:
-        n_samples: Số câu hỏi chạy (default 10, max 30).
-
-    Trả về:
-        EvalReport với Faithfulness, Context Recall, Recall@k, v.v.
-    """
-    _require_index(app.state)
-
-    n_samples = min(n_samples, 30)
-    logger.info(f"POST /eval/run — {n_samples} samples")
-
-    try:
-        loop = asyncio.get_event_loop()
-        report_dict = await loop.run_in_executor(
-            None, _run_eval_sync, n_samples, app.state
-        )
-        return report_dict
-    except Exception as e:
-        logger.error(f"Evaluation lỗi: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def _run_eval_sync(n_samples: int, state) -> dict:
-    """Chạy evaluation đồng bộ trong threadpool."""
-    from src.evaluation.evaluator import RAGEvaluator
-    from src.pipeline_m4 import rag_query
-    import json
-    from config import EVAL_DATASET_PATH
-
-    if not EVAL_DATASET_PATH.exists():
-        raise FileNotFoundError(f"eval_dataset.json không tồn tại: {EVAL_DATASET_PATH}")
-
-    with open(EVAL_DATASET_PATH, encoding="utf-8") as f:
-        all_samples = json.load(f)
-
-    sample_ids = [s["id"] for s in all_samples[:n_samples]]
-
-    def rag_fn(query: str):
-        return rag_query(query, state.retriever, state.reranker, state.llm)
-
-    evaluator = RAGEvaluator(rag_fn=rag_fn)
-    report    = evaluator.run(sample_ids=sample_ids, save=True)
-    return report.to_dict()
-
-
-# ─────────────────────────────────────────────────────────────
-# Root
-# ─────────────────────────────────────────────────────────────
-
-@app.get("/", tags=["System"])
-async def root():
-    return {
-        "name":    "RAG Library API",
-        "version": "1.0.0",
-        "docs":    "/docs",
-        "health":  "/health",
-        "endpoints": {
-            "ask":           "POST /ask",
-            "upload":        "POST /upload",
-            "rebuild_index": "POST /index/rebuild",
-            "evaluation":    "POST /eval/run",
-            "history":       "GET  /history",
-            "stats":         "GET  /stats",
-        },
-    }
+        user_input = st.chat_input("Nhập câu hỏi tra cứu học thuật tại đây...")
+
+    if user_input:
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        with st.chat_message("assistant"):
+            progress_text = st.empty()
+            progress_text.caption("🔍 Đang quét cơ sở dữ liệu FAISS và tái chấm điểm qua BGE-Reranker...")
+            
+            t0 = time.time()
+            candidates = retriever.retrieve(user_input, top_k=top_k)
+            t_dense = (time.time() - t0) * 1000
+            
+            t1 = time.time()
+            reranked_chunks = reranker.rerank(user_input, candidates, top_n=top_n)
+            t_rerank = (time.time() - t1) * 1000
+            
+            progress_text.empty()
+
+            from src.llm.prompter import AcademicPrompter
+            prompt = AcademicPrompter.build_prompt(user_input, reranked_chunks)
+
+            answer_placeholder = st.empty()
+            full_response = ""
+            t_gen_start = time.time()
+
+            for chunk_token in stream_ollama_response(prompt):
+                full_response += chunk_token
+                answer_placeholder.markdown(full_response + "▌")
+                
+            answer_placeholder.markdown(full_response)
+            t_gen = time.time() - t_gen_start
+            t_total = (t_dense + t_rerank) / 1000 + t_gen
+
+            perf_data = {
+                "dense_ms": t_dense,
+                "rerank_ms": t_rerank,
+                "gen_s": t_gen,
+                "total_s": t_total
+            }
+            
+            st.markdown(f"""
+            <div class="perf-container">
+                <div class="perf-card">
+                    <div class="perf-label">Dense Search</div>
+                    <div class="perf-value">{t_dense:.1f} ms</div>
+                </div>
+                <div class="perf-card">
+                    <div class="perf-label">Reranker</div>
+                    <div class="perf-value">{t_rerank:.1f} ms</div>
+                </div>
+                <div class="perf-card">
+                    <div class="perf-label">Ollama Sinh LLM</div>
+                    <div class="perf-value" style="color: #16A34A;">{t_gen:.2f} s</div>
+                </div>
+                <div class="perf-card">
+                    <div class="perf-label">Tổng Độ Trễ</div>
+                    <div class="perf-value" style="color: #2563EB;">{t_total:.2f} s</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if reranked_chunks:
+                with st.expander(f"📚 Xem {len(reranked_chunks)} tài liệu nguồn được trích dẫn làm căn cứ"):
+                    for s_idx, src in enumerate(reranked_chunks, 1):
+                        sub = src.get("subject", "N/A")
+                        title = src.get("title", "N/A")
+                        score = src.get("rerank_score", 0.0)
+                        txt = src.get("text", "")
+                        st.markdown(f"""
+                        <div class="source-box">
+                            <span class="source-tag">Môn: {sub}</span> &nbsp;
+                            <span class="source-tag" style="background:#F1F5F9; color:#475569;">Chủ đề: {title}</span> &nbsp;
+                            <span class="score-tag">Độ liên quan: {score:.2f}</span>
+                            <div style="font-size: 0.88rem; color: #334155; margin-top: 6px; line-height: 1.45;">
+                                "{txt[:280]}..."
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": full_response,
+                "sources": reranked_chunks,
+                "perf": perf_data
+            })
+
+# =====================================================================
+# TAB 2: GIAO DIỆN KHÁM PHÁ & XEM HỌC LIỆU SỐ THEO CHỦ ĐỀ
+# =====================================================================
+with tab_docs:
+    st.markdown("### 📖 Khám Phá Kho Học Liệu Số Theo Phân Môn")
+    st.caption("Sinh viên có thể lọc theo chuyên đề, tìm kiếm theo tiêu đề bài học và đọc trực tiếp nội dung chi tiết.")
+
+    if not library_catalog:
+        st.warning("⚠️ Chưa tìm thấy tài liệu nào trong thư mục `data/raw/`.")
+    else:
+        col_sub, col_search = st.columns([1, 2])
+        with col_sub:
+            subject_list = ["TẤT CẢ"] + sorted(list(library_catalog.keys()))
+            selected_subject = st.selectbox("📂 Chọn chuyên đề / môn học:", subject_list)
+        with col_search:
+            search_kw = st.text_input("🔍 Tìm kiếm tên tài liệu:", placeholder="Nhập từ khóa cần tìm (vd: database, thread, search...)")
+
+        # Lọc danh sách tài liệu
+        matched_docs = []
+        for sub, docs in library_catalog.items():
+            if selected_subject != "TẤT CẢ" and sub != selected_subject:
+                continue
+            for d in docs:
+                if search_kw.strip().lower() in d["file_name"].lower():
+                    item = d.copy()
+                    item["subject"] = sub
+                    matched_docs.append(item)
+
+        st.markdown(f"**Tìm thấy `{len(matched_docs)}` tài liệu phù hợp:**")
+
+        # Hiển thị tài liệu dạng thẻ kèm nút đọc nội dung
+        for doc in matched_docs[:50]:  # Giới hạn hiển thị 50 file mỗi trang để giao diện mượt
+            sub_name = doc["subject"]
+            file_name = doc["file_name"]
+            size_kb = doc["size_kb"]
+            file_path = doc["file_path"]
+
+            with st.expander(f"📄 [{sub_name}] {file_name} ({size_kb} KB)"):
+                st.write(f"**Đường dẫn:** `{file_path}`")
+                
+                # Đọc nội dung nếu là file text
+                if doc["extension"] == ".txt":
+                    try:
+                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+                            st.text_area("Nội dung trích xuất:", content[:3000] + ("\n... [Còn tiếp]" if len(content) > 3000 else ""), height=250)
+                    except Exception as e:
+                        st.error(f"Không thể mở file: {e}")
+                else:
+                    st.info("💡 Tài liệu định dạng nhị phân/PDF. Bạn có thể tải về để xem trọn vẹn:")
+                    try:
+                        with open(file_path, "rb") as f:
+                            st.download_button(
+                                label=f"⬇️ Tải xuống {file_name}",
+                                data=f,
+                                file_name=file_name,
+                                mime="application/octet-stream"
+                            )
+                    except Exception as e:
+                        st.error(f"Lỗi tải file: {e}")
+
+        if len(matched_docs) > 50:
+            st.info(f"💡 Đang hiển thị 50/{len(matched_docs)} tài liệu. Vui lòng nhập từ khóa tìm kiếm để thu hẹp phạm vi.")

@@ -1,58 +1,38 @@
-"""
-src/pipeline_m1.py
-------------------
-Luồng điều phối trung tâm xử lý dữ liệu hàng loạt của Milestone 1.
-"""
-
-import sys
 import time
-import json
 from pathlib import Path
+from src.preprocessing.chunker import process_file_to_chunks, save_chunks
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import DATA_RAW_DIR, DATA_PROCESSED_DIR
-from src.logger import get_logger
-from src.ingestion.document_loader import load_directory
-from src.ingestion.text_cleaner import clean_document
-from src.preprocessing.chunker import create_chunks_with_metadata
+def run_pipeline_m1(raw_dir: str = "data/raw", output_json: str = "data/processed/chunks.json"):
+    start_time = time.time()
+    raw_path = Path(raw_dir)
+    txt_files = list(raw_path.glob("*.txt"))
+    
+    print("=" * 60)
+    print(f"[*] BẮT ĐẦU OFFLINE PIPELINE - MILESTONE 1 (Ingestion & Chunking)")
+    print(f"[*] Tìm thấy {len(txt_files)} tệp dữ liệu thô trong {raw_path.resolve()}")
+    print("=" * 60)
 
-logger = get_logger(__name__)
-
-
-def run_milestone1_pipeline():
-    start_all = time.time()
-    logger.info("=" * 60)
-    logger.info("BẮT ĐẦU CHẠY PIPELINE TRÍCH XUẤT HÀNG LOẠT MILESTONE 1")
-    logger.info("=" * 60)
-
-    # 1. Đọc hàng loạt dữ liệu PDF từ kho raw
-    raw_docs = load_directory(DATA_RAW_DIR)
-    if not raw_docs:
-        logger.error("Không tìm thấy dữ liệu thô trong data/raw/!")
+    if not txt_files:
+        print("[-] Không tìm thấy file txt nào trong data/raw/! Hãy kiểm tra lại bước crawl.")
         return
 
-    # 2. Làm sạch văn bản chuyên sâu
-    logger.info("Đang xử lý chuẩn hóa và làm sạch văn bản...")
-    cleaned_docs = [clean_document(doc) for doc in raw_docs]
-
-    # 3. Chunking Paragraph-Aware
-    logger.info("Đang thực hiện phân rã văn bản thành các chunks...")
     all_chunks = []
-    for doc in cleaned_docs:
-        chunks = create_chunks_with_metadata(doc)
-        all_chunks.extend(chunks)
+    for idx, file_path in enumerate(txt_files, 1):
+        file_chunks = process_file_to_chunks(file_path)
+        all_chunks.extend(file_chunks)
+        if idx % 50 == 0 or idx == len(txt_files):
+            print(f" -> Đã xử lý [{idx}/{len(txt_files)}] file | Tổng số chunks hiện tại: {len(all_chunks)}")
 
-    # 4. Xuất kết quả
-    output_json_path = DATA_PROCESSED_DIR / "chunks.json"
-    with open(output_json_path, "w", encoding="utf-8") as f:
-        json.dump(all_chunks, f, ensure_ascii=False, indent=2)
-
-    logger.info("=" * 60)
-    logger.info(f"HOÀN THÀNH MILESTONE 1 TRONG {time.time() - start_all:.2f}s")
-    logger.info(f"Tổng số chunks sinh ra: {len(all_chunks)}")
-    logger.info(f"Tệp tin kết quả xuất thành công: {output_json_path}")
-    logger.info("=" * 60)
-
+    # Đóng gói và lưu dữ liệu kèm metadata
+    save_chunks(all_chunks, output_json)
+    
+    elapsed = time.time() - start_time
+    print("=" * 60)
+    print(f"    - Tổng tài liệu xử lý: {len(txt_files)} files")
+    print(f"    - Tổng số chunks sinh ra: {len(all_chunks)} chunks")
+    print(f"    - Thời gian thực thi: {elapsed:.2f} giây")
+    print(f"    - File tri thức xuất xưởng: {output_json}")
+    print("=" * 60)
 
 if __name__ == "__main__":
-    run_milestone1_pipeline()
+    run_pipeline_m1()

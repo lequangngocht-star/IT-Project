@@ -1,0 +1,36 @@
+﻿Query_ID,Subject,Query,Dense_Rank,Dense_Hit@1,Dense_Hit@3,Dense_Hit@5,Dense_MRR,Dense_Latency_ms,Rerank_Rank,Rerank_Hit@1,Rerank_Hit@3,Rerank_Hit@5,Rerank_MRR,Rerank_Latency_ms
+Q01,DB,What are the four ACID properties in database management systems and what does each guarantee?,1,1,1,1,1.0,2103.15,1,1,1,1,1.0,4259.87
+Q02,DB,"Explain database normalization from 1NF, 2NF to 3NF and Boyce-Codd normal form.",1,1,1,1,1.0,267.68,1,1,1,1,1.0,3084.89
+Q03,DB,How do B-tree and B+ tree indexes improve query performance in relational databases?,0,0,0,0,0.0,252.79,0,0,0,0,0.0,3145.38
+Q04,DB,What is two-phase locking protocol in concurrency control?,1,1,1,1,1.0,234.52,1,1,1,1,1.0,3085.46
+Q05,DSA,What is a Binary Search Tree and what is the worst-case time complexity of its search operation?,1,1,1,1,1.0,254.44,1,1,1,1,1.0,3069.08
+Q06,DSA,Explain Dijkstra's shortest path algorithm and its computational complexity.,1,1,1,1,1.0,240.2,1,1,1,1,1.0,2790.33
+Q07,DSA,How does a Hash Table handle hash collisions using chaining and open addressing?,1,1,1,1,1.0,232.68,1,1,1,1,1.0,3093.6
+Q08,DSA,Compare the time and space complexity of QuickSort versus MergeSort.,0,0,0,0,0.0,228.58,0,0,0,0,0.0,2818.04
+Q09,OS,Explain the difference between a process and a thread in operating systems.,1,1,1,1,1.0,216.39,1,1,1,1,1.0,2406.02
+Q10,OS,What is virtual memory and how does paging mechanism work?,1,1,1,1,1.0,223.57,1,1,1,1,1.0,2660.32
+Q11,OS,What is a deadlock and what are the four Coffman conditions required for deadlock?,0,0,0,0,0.0,235.16,2,0,1,1,0.5,2055.45
+Q12,OS,How does CPU scheduling work with Round Robin and Multilevel Feedback Queue?,1,1,1,1,1.0,231.41,1,1,1,1,1.0,2151.5
+Q13,AI,How does the A* search algorithm determine the optimal path using heuristic functions?,1,1,1,1,1.0,234.67,1,1,1,1,1.0,1923.84
+Q14,AI,Explain the Minimax algorithm and how Alpha-Beta pruning improves its efficiency.,0,0,0,0,0.0,240.97,0,0,0,0,0.0,2057.23
+Q15,AI,What is a Markov Decision Process and how is it used in reinforcement learning?,0,0,0,0,0.0,260.96,0,0,0,0,0.0,1946.9
+Q16,AI,"How do genetic algorithms use selection, crossover, and mutation for optimization?",0,0,0,0,0.0,237.3,0,0,0,0,0.0,2958.5
+Q17,ML,"What are the main differences between supervised, unsupervised, and reinforcement learning?",1,1,1,1,1.0,255.86,1,1,1,1,1.0,2753.84
+Q18,ML,Explain the bias-variance tradeoff in supervised machine learning models.,1,1,1,1,1.0,229.73,1,1,1,1,1.0,3310.45
+Q19,ML,How does gradient descent optimization work with stochastic gradient descent (SGD)?,0,0,0,0,0.0,259.26,0,0,0,0,0.0,2892.91
+Q20,ML,"What are precision, recall, F1-score, and ROC-AUC in classification evaluation?",1,1,1,1,1.0,265.87,0,0,0,0,0.0,2661.12
+Q21,DL,Explain the backpropagation algorithm using the chain rule in neural networks.,1,1,1,1,1.0,237.78,1,1,1,1,1.0,2945.15
+Q22,DL,What is the vanishing gradient problem and how do ReLU and residual connections solve it?,2,0,1,1,0.5,264.05,1,1,1,1,1.0,2961.49
+Q23,DL,How does the self-attention mechanism operate in Transformer architectures?,1,1,1,1,1.0,231.99,1,1,1,1,1.0,1904.86
+Q24,DL,Explain the role of Convolutional layers and Pooling layers in CNNs.,0,0,0,0,0.0,249.02,0,0,0,0,0.0,2029.52
+Q25,CV,What are the main steps involved in the Canny edge detector algorithm?,0,0,0,0,0.0,260.91,0,0,0,0,0.0,1933.14
+Q26,CV,How does YOLO (You Only Look Once) achieve real-time object detection?,0,0,0,0,0.0,230.38,0,0,0,0,0.0,1938.68
+Q27,CV,What is image segmentation and how does semantic segmentation differ from instance segmentation?,2,0,1,1,0.5,238.01,2,0,1,1,0.5,1760.26
+Q28,NLP,What is tokenization and how does Byte Pair Encoding (BPE) work in language models?,0,0,0,0,0.0,252.58,2,0,1,1,0.5,2869.39
+Q29,NLP,Explain Word2Vec with Continuous Bag of Words (CBOW) and Skip-gram architectures.,1,1,1,1,1.0,252.65,1,1,1,1,1.0,3144.38
+Q30,NLP,What is Named Entity Recognition (NER) and how is it evaluated?,1,1,1,1,1.0,242.07,1,1,1,1,1.0,2909.86
+Q31,SE,Compare the Waterfall model and Agile methodology in software development lifecycles.,1,1,1,1,1.0,231.79,1,1,1,1,1.0,2669.03
+Q32,SE,Explain the SOLID principles in object-oriented software design.,0,0,0,0,0.0,220.66,0,0,0,0,0.0,2684.16
+Q33,SE,What is continuous integration and continuous delivery (CI/CD) in DevOps?,0,0,0,0,0.0,237.8,0,0,0,0,0.0,2824.3
+Q34,Networks,Explain the 7 layers of the OSI model and compare it with the TCP/IP suite.,2,0,1,1,0.5,260.8,2,0,1,1,0.5,2776.29
+Q35,Networks,How does the TCP three-way handshake establish a reliable connection?,1,1,1,1,1.0,235.92,1,1,1,1,1.0,2778.11
