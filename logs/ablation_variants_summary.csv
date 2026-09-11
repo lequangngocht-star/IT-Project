@@ -1,0 +1,7 @@
+﻿Cấu hình,Recall@3 (%),Recall@5 (%),Hit@1 / Precision (%),Faithfulness (0 - 1.0),Retrieval Latency (ms),LLM Latency (s),Tổng thời gian (s)
+Baseline (Dense Only),8.6,8.6,5.7,0.63,222.6,7.27,7.49
+Variant 1 (+ Reranker),8.6,8.6,8.6,0.62,2548.3,6.83,9.38
+Variant 2 (+ Hybrid BM25),11.4,11.4,11.4,0.58,285.6,6.9,7.19
+Variant 3 (+ HyDE),14.3,14.3,5.7,0.66,4212.9,6.64,10.86
+Variant 4 (V2 + V1 (Hybrid + Rerank)),11.4,11.4,8.6,0.64,2787.7,6.75,9.54
+Variant 5 (V4 + LLM 3B),11.4,11.4,8.6,0.64,2642.1,9.39,12.03

@@ -14,7 +14,7 @@ FAISS_INDEX_PATH = VECTOR_STORE_DIR / "faiss.index"
 FAISS_META_PATH = VECTOR_STORE_DIR / "faiss_meta.json"
 
 # Cấu hình Embedding
-# - "BAAI/bge-m3" (1024 dims, đa ngôn ngữ, chuẩn đề tài SĐH)
+# - "BAAI/bge-m3" (1024 dims, đa ngôn ngữ)
 EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
 EMBEDDING_BATCH_SIZE = 32
 EMBEDDING_DEVICE = "cpu"  # Đổi thành "cuda" nếu chạy trên Colab/máy có GPU NVIDIA
@@ -30,3 +30,5 @@ LLM_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 LLM_DEVICE = "cpu"
 LLM_MAX_NEW_TOKENS = 256              # Đủ cho câu trả lời trọn vẹn, không bị cụt chữ
 LLM_TEMPERATURE = 0.0                 # Nhiệt độ 0: Tất định, bám sát Grounding tuyệt đối
+
+EVAL_DATASET_PATH="D:\digital_library_rag\tests\eval_testset_35.json"
