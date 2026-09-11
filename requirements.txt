@@ -1,0 +1,28 @@
+# --- Frontend & UI Dashboard ---
+streamlit==1.63.0
+
+# --- Xử lý Dữ liệu, Bóc tách & Chuẩn hóa ---
+pypdf>=3.17.0
+pdfplumber>=0.10.3
+regex>=2023.12.25
+
+# --- Biểu diễn Ngữ nghĩa (Embedding) & Tái xếp hạng (Reranking) ---
+sentence-transformers>=2.3.0
+transformers>=4.38.0
+torch>=2.1.0
+
+# --- Cơ sở dữ liệu Vector & Thuật toán Tìm kiếm ---
+faiss-cpu>=1.7.4
+rank-bm25>=0.2.2
+
+# --- Giao tiếp Động cơ Suy luận LLM Cục bộ (Ollama) ---
+requests>=2.31.0
+urllib3>=2.0.7
+
+# --- Thực nghiệm Học thuật, Tính toán Độ đo & Trực quan hóa ---
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+pytest>=7.4.0
+rich>=13.0.0
